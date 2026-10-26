@@ -53,3 +53,9 @@ The evaluation includes a day-grouped out-of-fold M3 LightGBM classifier, a simp
 ## Limits
 
 The source contains five simulated people and a single scripted generator. Robustness results from a changed seed remain synthetic stress tests, not external validation. At 2 Hz, heart rate cannot establish atrial fibrillation or provide beat-to-beat HRV. “AF-like”, “dizzy-like”, illness-like, and desaturation alerts refer only to scripted patterns. NEWS2-inspired inputs are incomplete and rules require clinician review before any clinical interpretation.
+
+## Local gig-worker assistance
+
+The same local server also serves `/gigs.html` and `/api/gigs/*`. It provides admin and gig-worker demo views backed by the same SQLite file as the Sahaya replay. From an open alert, use **Assign Helper / Create Gig** to prefill a helper task; the organisation explicitly chooses whether assistance is appropriate. Completing the helper task does not close the health alert.
+
+The gig module is an unauthenticated local demo, bound to loopback. Its seeded identity status is synthetic and is not Aadhaar verification. All helper, client, contact, and payout details are fictional. See the repository-root `FINAL_INTEGRATION_REPORT.md` for the walkthrough and verification report.

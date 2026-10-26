@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import threading
@@ -15,6 +16,7 @@ import pandas as pd
 
 from .features import minute_features
 from .io import data_dir, load_person
+from . import gigs
 
 PROJECT = Path(__file__).resolve().parents[1]
 WEB = PROJECT / "web"
@@ -43,6 +45,9 @@ def _db():
     con.execute("CREATE TABLE IF NOT EXISTS snapshots (minute TEXT NOT NULL, person_id TEXT NOT NULL, hr REAL, spo2 REAL, sbp REAL, dbp REAL, temp REAL, motion REAL, PRIMARY KEY(minute, person_id))")
     con.execute("CREATE TABLE IF NOT EXISTS workflow (incident_id TEXT PRIMARY KEY, status TEXT NOT NULL, updated TEXT NOT NULL, note TEXT NOT NULL DEFAULT '')")
     con.execute("CREATE TABLE IF NOT EXISTS workflow_log (entry_id INTEGER PRIMARY KEY AUTOINCREMENT, incident_id TEXT NOT NULL, status TEXT NOT NULL, updated TEXT NOT NULL)")
+    con.execute("CREATE TABLE IF NOT EXISTS demo_readings (reading_id TEXT PRIMARY KEY, person_id TEXT NOT NULL, observed_at TEXT NOT NULL, values_json TEXT NOT NULL, simulated INTEGER NOT NULL DEFAULT 0)")
+    con.execute("CREATE INDEX IF NOT EXISTS demo_readings_person_time_idx ON demo_readings(person_id,observed_at DESC)")
+    con.execute("CREATE TABLE IF NOT EXISTS demo_incidents (incident_id TEXT PRIMARY KEY, person_id TEXT NOT NULL, start_ts TEXT NOT NULL, tier TEXT NOT NULL, summary TEXT NOT NULL, reason_text TEXT NOT NULL, sources TEXT NOT NULL, source_label TEXT NOT NULL)")
     return con
 
 
@@ -86,6 +91,23 @@ def _load_feed():
     ALERTS.sort(key=lambda a: (a["_index"], a["person_id"]))
 
 
+def _restore_demo_incidents():
+    con = _db()
+    rows = con.execute("SELECT d.*,COALESCE(w.status,'New') FROM demo_incidents d LEFT JOIN workflow w ON w.incident_id=d.incident_id WHERE COALESCE(w.status,'New')!='Resolved'").fetchall()
+    con.close()
+    for row in rows:
+        incident_id, person_id, start_ts, tier, summary, reason, sources, source_label, status = row
+        STATE["active"][incident_id] = {"incident_id": incident_id, "person_id": person_id,
+            "start_ts": start_ts, "tier_reached_ts": start_ts, "end_ts": start_ts,
+            "tier": tier, "sources": sources, "reason_text": reason,
+            "suggested_action": "Human review of submitted demonstration input",
+            "_index": STATE["index"], "display_tier": tier, "summary": summary,
+            "source_label": source_label, "status": status}
+        STATE["triggered"].add(incident_id)
+    if STATE["active"]:
+        STATE["paused"] = True
+
+
 def _summary(alert):
     source = alert.get("sources", "")
     text = alert.get("reason_text", "")
@@ -103,7 +125,7 @@ def _summary(alert):
 def _category(alert):
     source = alert.get("sources", "").lower()
     summary = alert.get("summary", "").lower()
-    if "fall" in source or "fall" in summary: return "fall"
+    if "fall" in source or "fall" in summary or "impact" in summary: return "fall"
     if "oxygen" in summary or "spo2" in summary or "desaturation" in source: return "oxygen"
     if "pressure" in summary or "hypertens" in source: return "pressure"
     if "heart" in summary or "af" in source: return "rhythm"
@@ -122,7 +144,8 @@ def _decorate_alert(alert):
         actions = ["Arrange a wellbeing call and ask about current symptoms.", "Ask staff to review the latest readings and repeat the measurement if appropriate.", "Consider a home check if the change persists or the client feels worse."]
     if category == "fall":
         actions = ["Try the client contact and request an immediate in-person wellbeing check.", "If the client is injured or cannot be reached, use the organisation’s urgent escalation procedure.", "Record who accepted the response and when."]
-    return {**alert, "client_name": profile["name"], "profile_story": profile["story"],
+    return {**alert, "source_label": alert.get("source_label") or ("Model + rule replay" if "M3" in alert.get("sources", "") else "Rule replay"),
+            "client_name": profile["name"], "profile_story": profile["story"],
             "why_flagged": alert.get("reason_text") or alert["summary"], "similar_cases": similar[-4:],
             "similar_case_count": len(profile.get("history_examples", [])) + len(previous), "actions": actions,
             "contacts": [{"label": "Client", "name": profile["name"], "number": profile["client_phone"]},
@@ -198,7 +221,74 @@ def _vitals(index):
         result[pid] = {"hr": _num(r.hr) if r else None, "spo2": _num(r.spo2) if r else None,
                        "sbp": _num(r.sbp) if r else None, "dbp": _num(r.dbp) if r else None,
                        "temp": _num(r.temp) if r else None, "motion": _num(r.motion) if r else None}
+    con = _db()
+    recent = con.execute("SELECT person_id,observed_at,values_json,simulated FROM demo_readings ORDER BY observed_at DESC").fetchall()
+    con.close()
+    seen = set()
+    for pid, observed_at, values_json, simulated in recent:
+        values = json.loads(values_json)
+        if pid not in seen:
+            seen.add(pid)
+            result[pid]["input_source"] = "Synthetic demo input" if simulated else "Submitted reading"
+            result[pid]["input_time"] = observed_at
+        for key, value in values.items():
+            if key not in result[pid].get("_input_values", {}):
+                result[pid].setdefault("_input_values", {})[key] = value
+    for pid in seen:
+        result[pid].update(result[pid].pop("_input_values", {}))
     return ts, result
+
+
+def _baseline(person_id, field, limit=180):
+    column = {"hr": "hr", "spo2": "spo2", "sbp": "sbp", "dbp": "dbp", "temp": "temp", "motion": "motion"}[field]
+    ts, _ = _snapshot_rows(STATE["index"])
+    rows = FEED[(FEED.person_id == person_id) & (FEED.minute <= ts)][column].dropna().tail(limit)
+    return float(rows.median()) if not rows.empty else None
+
+
+def _classify_demo_input(person_id, values):
+    """Conservative demonstration rules. These are not ML inference or clinical thresholds."""
+    baseline = {key: _baseline(person_id, key) for key in values}
+    if values.get("motion", 0) >= 1.5:
+        return "Red", "Impact-like movement reading", "High movement value recorded; check the person directly. A single sensor reading cannot confirm a fall."
+    if values.get("spo2", 100) <= 88 or values.get("hr", 0) >= 140 or values.get("hr", 100) <= 40 or values.get("sbp", 0) >= 200:
+        return "Red", "Configured demonstration threshold crossed", "One submitted value crossed a demonstration threshold; verify the measurement and check the person directly."
+    changes = []
+    if "spo2" in values and baseline.get("spo2") is not None and values["spo2"] <= baseline["spo2"] - 3:
+        changes.append("oxygen below the recent replay baseline")
+    if "hr" in values and baseline.get("hr") is not None and abs(values["hr"] - baseline["hr"]) >= 25:
+        changes.append("heart rate changed from the recent replay baseline")
+    if "sbp" in values and baseline.get("sbp") is not None and abs(values["sbp"] - baseline["sbp"]) >= 30:
+        changes.append("systolic pressure changed from the recent replay baseline")
+    if changes:
+        return "Yellow", "Submitted reading differs from replay baseline", "; ".join(changes) + ". This is a rule-based demo indicator for human review, not a diagnosis."
+    return None
+
+
+def _record_reading(person_id, values, simulated=False):
+    observed = datetime.now().astimezone().isoformat(timespec="seconds")
+    reading_id = f"{person_id}-input-{int(time.time() * 1000)}"
+    indicator = _classify_demo_input(person_id, values)
+    con = _db()
+    con.execute("INSERT INTO demo_readings(reading_id,person_id,observed_at,values_json,simulated) VALUES (?,?,?,?,?)",
+                (reading_id, person_id, observed, json.dumps(values, allow_nan=False), int(simulated)))
+    if indicator:
+        tier, summary, reason = indicator
+        incident_id = f"{reading_id}-alert"
+        raw = {"incident_id": incident_id, "person_id": person_id, "start_ts": observed,
+               "tier_reached_ts": observed, "end_ts": observed, "tier": tier,
+               "sources": "demo_rule", "reason_text": reason, "suggested_action": "Human review of submitted demonstration input",
+               "_index": STATE["index"], "display_tier": tier, "summary": summary,
+               "source_label": "Rule-based demo input" if simulated else "Rule-based submitted reading", "status": "New"}
+        con.execute("INSERT INTO demo_incidents VALUES (?,?,?,?,?,?,?,?)",
+                    (incident_id, person_id, observed, tier, summary, reason, "demo_rule", raw["source_label"]))
+        con.execute("INSERT OR REPLACE INTO workflow(incident_id,status,updated,note) VALUES (?,?,?,?)", (incident_id, "New", observed, summary))
+        STATE["active"][incident_id] = raw
+        STATE["triggered"].add(incident_id)
+        STATE["paused"] = True
+        STATE["fraction"] = 0.0
+    con.commit(); con.close()
+    return indicator
 
 
 def _state():
@@ -230,8 +320,24 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/" or path == "/index.html":
             return self._send((WEB / "index.html").read_bytes(), mime="text/html; charset=utf-8")
+        if path == "/whatsapp.html":
+            return self._send((WEB / "whatsapp.html").read_bytes(), mime="text/html; charset=utf-8")
+        if path == "/gigs.html":
+            return self._send((WEB / "gigs.html").read_bytes(), mime="text/html; charset=utf-8")
+        if path in {"/gigs.css", "/gigs.js"}:
+            mime = "text/css; charset=utf-8" if path.endswith(".css") else "text/javascript; charset=utf-8"
+            return self._send((WEB / path[1:]).read_bytes(), mime=mime)
         if path in {"/styles.css", "/app.js"}:
             return self._send((WEB / path[1:]).read_bytes(), mime="text/css; charset=utf-8" if path.endswith("css") else "text/javascript; charset=utf-8")
+        if path == "/api/health":
+            return self._send({"ok": FEED is not None, "profiles": len(PEOPLE), "replay_minutes": TOTAL_MINUTES,
+                               "replay_alerts": len(ALERTS), "reading_input": True})
+        if path.startswith("/api/gigs/"):
+            with LOCK:
+                alerts = [_decorate_alert(a) for a in STATE["active"].values()]
+                code, result = gigs.dispatch(DB_FILE, "GET", path,
+                    query_string=urlparse(self.path).query, alerts=alerts)
+            return self._send(result, code)
         with LOCK:
             if path == "/api/state": return self._send(_state())
             if path == "/api/profile":
@@ -241,14 +347,69 @@ class Handler(BaseHTTPRequestHandler):
                 con = _db()
                 history = con.execute("SELECT minute,hr,spo2,sbp,dbp FROM snapshots WHERE person_id=? ORDER BY minute DESC LIMIT 180", (pid,)).fetchall()
                 actions = con.execute("SELECT incident_id,status,updated FROM workflow_log WHERE incident_id IN (SELECT incident_id FROM workflow WHERE incident_id LIKE ?) ORDER BY entry_id DESC LIMIT 20", (f"{pid}-%",)).fetchall()
-                con.close()
+                input_rows = con.execute("SELECT observed_at,values_json FROM demo_readings WHERE person_id=? ORDER BY observed_at DESC LIMIT 180", (pid,)).fetchall()
+                manual_alerts = con.execute("SELECT d.*,COALESCE(w.status,'New') FROM demo_incidents d LEFT JOIN workflow w ON w.incident_id=d.incident_id WHERE d.person_id=? ORDER BY d.start_ts", (pid,)).fetchall()
                 history.reverse()
-                return self._send({"id": pid, **PEOPLE[pid], "vitals": vitals[pid], "now": ts.isoformat(), "history": [{"minute": r[0], "hr": r[1], "spo2": r[2], "sbp": r[3], "dbp": r[4]} for r in history], "workflow_history": [{"incident_id": r[0], "status": r[1], "updated": r[2]} for r in actions], "alerts": [_decorate_alert(a) for a in ALERTS if a["person_id"] == pid and a["_index"] <= STATE["index"]]})
+                history = [{"minute": r[0], "hr": r[1], "spo2": r[2], "sbp": r[3], "dbp": r[4]} for r in history]
+                history.extend({"minute": r[0], **json.loads(r[1])} for r in reversed(input_rows))
+                profile_alerts = [_decorate_alert(a) for a in ALERTS if a["person_id"] == pid and a["_index"] <= STATE["index"]]
+                for a in manual_alerts:
+                    raw = {"incident_id": a[0], "person_id": a[1], "start_ts": a[2], "tier": a[3], "summary": a[4], "reason_text": a[5], "sources": a[6], "source_label": a[7], "status": a[8], "display_tier": a[3], "_index": STATE["index"]}
+                    profile_alerts.append(_decorate_alert(raw))
+                con.close()
+                return self._send({"id": pid, **PEOPLE[pid], "vitals": vitals[pid], "now": ts.isoformat(), "history": history, "workflow_history": [{"incident_id": r[0], "status": r[1], "updated": r[2]} for r in actions], "alerts": profile_alerts})
         return self._send({"error": "Not found"}, 404)
 
     def do_POST(self):
-        data = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 16_384:
+                return self._send({"error": "Request must contain a JSON body smaller than 16 KB."}, 413 if length > 16_384 else 400)
+            data = json.loads(self.rfile.read(length))
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return self._send({"error": "Invalid JSON request body."}, 400)
         with LOCK:
+            path = urlparse(self.path).path
+            if path.startswith("/api/gigs/"):
+                alerts = [_decorate_alert(a) for a in STATE["active"].values()]
+                code, result = gigs.dispatch(DB_FILE, "POST", path, data,
+                    query_string=urlparse(self.path).query, alerts=alerts)
+                return self._send(result, code)
+            if self.path in {"/api/readings", "/api/simulate"}:
+                person_id = str(data.get("person_id", ""))
+                if person_id not in PEOPLE:
+                    return self._send({"error": "Choose a client from the demonstration directory."}, 422)
+                simulated = self.path == "/api/simulate"
+                if simulated:
+                    scenario = data.get("scenario", "low_oxygen")
+                    if scenario == "baseline_change":
+                        base = _baseline(person_id, "hr") or 72
+                        values = {"hr": round(base + 30, 1)}
+                    elif scenario == "normal":
+                        values = {"hr": round(_baseline(person_id, "hr") or 72, 1), "spo2": round(_baseline(person_id, "spo2") or 96, 1)}
+                    else:
+                        base = _baseline(person_id, "spo2") or 96
+                        values = {"spo2": round(min(88, base - 9), 1)}
+                else:
+                    payload = data.get("values")
+                    if not isinstance(payload, dict):
+                        return self._send({"error": "Enter at least one vital or activity reading."}, 422)
+                    limits = {"hr": (25, 240), "spo2": (50, 100), "sbp": (50, 300), "dbp": (30, 200), "temp": (25, 45), "motion": (0, 16)}
+                    if not payload or any(k not in limits for k in payload):
+                        return self._send({"error": "Use heart rate, oxygen, blood pressure, temperature, or movement fields."}, 422)
+                    values = {}
+                    for key, value in payload.items():
+                        try: value = float(value)
+                        except (TypeError, ValueError): return self._send({"error": f"Enter a number for {key}."}, 422)
+                        low, high = limits[key]
+                        if not math.isfinite(value) or not low <= value <= high:
+                            return self._send({"error": f"{key} must be between {low} and {high}."}, 422)
+                        values[key] = value
+                indicator = _record_reading(person_id, values, simulated)
+                state = _state()
+                state["input_notice"] = ("Demo reading saved; a rule-based indicator was raised for human review." if indicator else "Reading saved; no configured demo rule was crossed.")
+                state["input_source"] = "synthetic" if simulated else "submitted"
+                return self._send(state)
             if self.path == "/api/control":
                 action = data.get("action")
                 if action == "start": STATE["started"] = True; STATE["paused"] = False; _store_snapshot(STATE["index"])
@@ -256,7 +417,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif action == "resume" and not STATE["active"]: STATE["paused"] = False; STATE["started"] = True
                 elif action == "reset":
                     STATE.update(index=0, speed=3600, fraction=0.0, paused=False, last_tick=time.monotonic(), active={}, triggered=set(), started=False)
-                    con = _db(); con.execute("DELETE FROM snapshots"); con.execute("DELETE FROM workflow"); con.execute("DELETE FROM workflow_log"); con.commit(); con.close()
+                    con = _db(); con.execute("DELETE FROM snapshots"); con.execute("DELETE FROM workflow"); con.execute("DELETE FROM workflow_log"); con.execute("DELETE FROM demo_readings"); con.execute("DELETE FROM demo_incidents"); con.commit(); con.close()
                 STATE["last_tick"] = time.monotonic()
                 return self._send(_state())
             if self.path == "/api/speed":
@@ -280,6 +441,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     _load_feed()
+    _restore_demo_incidents()
+    gigs.initialize(DB_FILE)
     print("Synthetic presentation dashboard: http://127.0.0.1:8765")
     print("Building / loading the minute-by-minute synthetic replay may take a few minutes on first launch.")
     ThreadingHTTPServer(("127.0.0.1", 8765), Handler).serve_forever()

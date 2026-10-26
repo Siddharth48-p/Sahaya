@@ -24,7 +24,8 @@ function vitalStrip(c) {
 }
 function clientCard(c) {
   const [status, cls] = statusFor(c);
-  return `<article class="client-card directory-card" onclick="openProfile('${c.id}')"><div class="client-main"><div class="client-avatar">${initials(c.name)}</div><div class="client-identity"><b>${esc(c.name)}</b><small>${c.age} years · ${c.id}</small><div class="condition-tags">${c.conditions.map((x) => `<span class="condition-tag">${esc(x)}</span>`).join('')}</div></div>${vitalStrip(c)}<div class="client-status"><span class="status-pill ${cls}">${status}</span></div><span class="open-chevron">›</span></div></article>`;
+  const inputTag = c.vitals.input_source ? `<small class="reading-origin">${esc(c.vitals.input_source)} · ${esc(fmtShort(c.vitals.input_time))}</small>` : '';
+  return `<article class="client-card directory-card" onclick="openProfile('${c.id}')"><div class="client-main"><div class="client-avatar">${initials(c.name)}</div><div class="client-identity"><b>${esc(c.name)}</b><small>${c.age} years · ${c.id}</small><div class="condition-tags">${c.conditions.map((x) => `<span class="condition-tag">${esc(x)}</span>`).join('')}</div></div>${vitalStrip(c)}<div class="client-status"><span class="status-pill ${cls}">${status}</span>${inputTag}</div><span class="open-chevron">›</span></div></article>`;
 }
 function contactLine(contact) {
   return `<span class="contact-line"><b>${esc(contact.label)}</b><span>${esc(contact.name)}</span><code>${esc(contact.number)}</code></span>`;
@@ -48,7 +49,7 @@ function alertCard(a) {
     <div class="report-section"><h3>Similar past cases <span>${a.similar_case_count || 0} on record</span></h3><div class="case-list">${cases}</div></div>
     <div class="report-bottom"><div class="report-section actions-section"><h3>Suggested team actions</h3><ul>${(a.actions || []).map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>
       <div class="report-section contacts-section"><h3>Contact directory</h3><p class="placeholder-note">${a.source_label === 'WhatsApp voice report' ? 'Sender number from the incoming message · confirm identity before calling' : 'Training-only contact placeholders · not for dialing'}</p>${(a.contacts || []).map(contactLine).join('')}</div></div>
-    <div class="alert-workflow"><div class="workflow-label">${esc(statusLabel)}</div><div class="workflow-actions">${workflowControls}</div></div>
+    <div class="alert-workflow"><div class="workflow-label">${esc(statusLabel)}</div><div class="workflow-actions">${workflowControls}<a class="workflow-btn" data-create-helper-gig="${esc(a.incident_id)}" href="/gigs.html?alert_id=${encodeURIComponent(a.incident_id)}">Assign Helper / Create Gig</a></div></div>
     <div class="progress-track"><div class="progress-fill" style="width:${Math.min(100, progress * 33.33)}%"></div></div>
   </article>`;
 }
@@ -59,6 +60,8 @@ function switchView(view) {
   $('#dashboardView').classList.toggle('hidden', !isDashboard);
   $('#directoryView').classList.toggle('hidden', !isDirectory);
   $('#inboxView').classList.toggle('hidden', !isInbox);
+  $('#gig-progress-panel').classList.toggle('hidden', !isDashboard);
+  $('#readingInputPanel').classList.toggle('hidden', !isDashboard);
   $('#dashboardNav').classList.toggle('active', isDashboard);
   $('#clientsNav').classList.toggle('active', isDirectory);
   $('#inboxNav').classList.toggle('active', isInbox);
@@ -90,6 +93,7 @@ function render(state) {
   $('#redTotal').textContent = String(state.red_count).padStart(2, '0');
   $('#redBadge').textContent = state.red_count;
   $('#yellowBadge').textContent = state.yellow_count;
+  if (state.input_notice) $('#readingInputStatus').textContent = state.input_notice;
   const run = $('#runLabel');
   const pulse = $('.live-pulse');
   if (state.complete) { run.textContent = 'RECORD COMPLETE'; pulse.classList.remove('on'); }
@@ -109,9 +113,44 @@ function render(state) {
   if (state.paused && state.active_alerts.length) $('#redAlerts').insertAdjacentHTML('afterbegin', '<div class="pause-ribbon show">⏸ Timeline and incoming readings are held until the open reports are resolved.</div>');
   if (selectedProfile && $('#profileOverlay').classList.contains('open')) openProfile(selectedProfile, true);
 }
+async function refreshGigProgress() {
+  const host = $('#gig-progress-list');
+  if (!host) return;
+  try {
+    const response = await fetch('/api/gigs/state?role=admin', { cache: 'no-store' });
+    if (!response.ok) throw new Error('Gig data unavailable');
+    const data = await response.json();
+    const rows = data.tasks.filter((task) => !['open', 'draft', 'done', 'cancelled'].includes(task.status));
+    host.innerHTML = rows.length ? rows.map((task) => `<div class="gig-progress-row"><b>${esc(task.title)}</b><span>${esc(task.worker_name || 'Awaiting helper')} · ${esc(task.status.replaceAll('_', ' '))}</span><small>${esc(task.location)}${task.related_alert_id ? ` · Linked Sahaya alert ${esc(task.related_alert_id)}` : ''}</small></div>`).join('') : '<div class="empty-state">No helper tasks have been created yet.</div>';
+  } catch { host.innerHTML = '<div class="empty-state">Gig management is temporarily unavailable.</div>'; }
+}
 async function refresh() { try { const response = await fetch('/api/state', { cache: 'no-store' }); if (response.status === 401) { showAccessGate(); return; } document.body.classList.remove('auth-check'); render(await response.json()); } catch { document.body.classList.remove('auth-check'); $('#runLabel').textContent = 'CONNECTION INTERRUPTED'; } }
 async function post(path, body) { const response = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); if (response.status === 401) { showAccessGate(); throw new Error('Sign in required'); } const state = await response.json(); if (!response.ok) throw new Error(state.error || 'Request failed'); render(state); return state; }
+async function submitDemoInput(path, payload, button) {
+  const status = $('#readingInputStatus');
+  const buttons = [...document.querySelectorAll('#readingForm button')];
+  buttons.forEach((item) => { item.disabled = true; });
+  status.textContent = 'Saving the reading…';
+  try {
+    const response = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Could not save this reading.');
+    render(result);
+    status.textContent = result.input_notice || 'Reading saved.';
+  } catch (error) {
+    status.textContent = error.message || 'The dashboard could not save this reading. Check that the local server is running.';
+  } finally {
+    buttons.forEach((item) => { item.disabled = false; });
+    if (button) button.focus();
+  }
+}
 window.workflow = async (id, action) => { await post('/api/workflow', { incident_id: id, action }); if (action === 'Resolved') showToast('Report closed · timeline resumed'); };
+document.addEventListener('click', (event) => {
+  const link = event.target.closest('[data-create-helper-gig]');
+  if (!link) return;
+  event.preventDefault();
+  window.location.href = `/gigs.html?alert_id=${encodeURIComponent(link.dataset.createHelperGig)}`;
+});
 function showToast(message) { const toast = $('#toast'); toast.textContent = message; toast.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => toast.classList.remove('show'), 2300); }
 
 window.openProfile = async (id, silent = false) => {
@@ -165,6 +204,20 @@ $('#startBtn').addEventListener('click', () => post('/api/control', { action: la
 $('#pauseBtn').addEventListener('click', () => post('/api/control', { action: 'pause' }));
 $('#resetBtn').addEventListener('click', async () => { if (confirm('Restart the training record from the beginning?')) { selectedProfile = null; $('#profileOverlay').classList.remove('open'); await post('/api/control', { action: 'reset' }); showToast('Record restarted'); } });
 $('#speed').addEventListener('change', (event) => post('/api/speed', { speed: Number(event.target.value) }));
+$('#readingForm').addEventListener('submit', (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const values = {};
+  for (const key of ['hr', 'spo2', 'sbp', 'dbp', 'temp', 'motion']) {
+    const value = form.elements[key].value;
+    if (value !== '') values[key] = Number(value);
+  }
+  if (!Object.keys(values).length) { $('#readingInputStatus').textContent = 'Enter at least one vital or activity value.'; return; }
+  submitDemoInput('/api/readings', { person_id: form.elements.person_id.value, values }, form.querySelector('[type="submit"]'));
+});
+document.querySelectorAll('[data-simulate]').forEach((button) => button.addEventListener('click', () => {
+  submitDemoInput('/api/simulate', { person_id: $('#readingPerson').value, scenario: button.dataset.simulate }, button);
+}));
 
 function showAccessGate() { document.body.classList.remove('auth-check'); $('#accessGate').classList.remove('hidden'); $('#accessGate').setAttribute('aria-hidden', 'false'); }
 $('#accessForm').addEventListener('submit', async (event) => {
@@ -320,4 +373,4 @@ window.addEventListener('message', (event) => {
   }
 });
 
-refresh(); setInterval(refresh, 1500);
+refresh(); refreshGigProgress(); setInterval(refresh, 1500); setInterval(refreshGigProgress, 5000);

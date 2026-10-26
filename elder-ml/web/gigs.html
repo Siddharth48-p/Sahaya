@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Sahaya · Gig Management</title><link rel="stylesheet" href="/gigs.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/"><span class="brand-mark">✳</span><span><b>Sahaya</b><small>CARE + LOCAL ASSISTANCE</small></span></a>
+    <div class="mode-switch" role="group" aria-label="Demo role">
+      <button class="role-tab selected" data-role="admin">Organisation</button>
+      <button class="role-tab" data-role="worker">Gig Worker</button>
+    </div>
+    <div class="top-actions"><span class="demo-pill">LOCAL DEMO · ROLE SWITCH IS NOT SECURITY</span><button class="button light" id="reset-demo">↺ Reset Demo</button><a class="button light" href="/">Sahaya alerts</a></div>
+  </header>
+  <div class="notice"><b>Synthetic demo data.</b> Demo identity status is synthetic and is not Aadhaar verification. Sample names, contact details, tasks and payments are not real. Do not use for real care coordination.</div>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="side-head"><span class="side-caption" id="side-caption">ORGANISATION</span><select id="worker-select" class="hidden" aria-label="Select demo helper"></select></div>
+      <nav id="admin-nav" class="nav-list">
+        <button data-view="overview" class="nav-btn selected">Overview</button><button data-view="helpers" class="nav-btn">Helpers</button><button data-view="create" class="nav-btn">Create Gig</button><button data-view="gigs" class="nav-btn">Manage Gigs</button><button data-view="notifications" class="nav-btn">Notifications <span id="admin-notice-count" class="count"></span></button><button data-view="analytics" class="nav-btn">Analytics</button>
+      </nav>
+      <nav id="worker-nav" class="nav-list hidden">
+        <button data-view="home" class="nav-btn selected">Home</button><button data-view="available" class="nav-btn">Available Gigs <span id="offer-count" class="count"></span></button><button data-view="tasks" class="nav-btn">My Tasks</button><button data-view="earnings" class="nav-btn">Earnings</button><button data-view="profile" class="nav-btn">Profile</button>
+      </nav>
+      <div class="side-foot"><span class="online-dot"></span> Shared Sahaya SQLite</div>
+    </aside>
+    <main class="main"><div id="view-host" aria-live="polite"><div class="loading">Loading local demo…</div></div></main>
+  </div>
+  <div id="incoming" class="incoming hidden" role="dialog" aria-modal="true" aria-labelledby="incoming-title">
+    <div class="incoming-card"><div class="incoming-label"><span class="pulse"></span> NEW HELPER TASK</div><button class="close" id="incoming-close" aria-label="Dismiss offer">×</button><h2 id="incoming-title"></h2><p id="incoming-category" class="muted"></p><div id="incoming-details" class="incoming-grid"></div><p id="incoming-summary" class="muted"></p><div id="incoming-reason" class="reason"></div><div class="incoming-actions"><button class="button secondary" id="incoming-pass">Pass</button><button class="button primary" id="incoming-accept">Accept Gig</button></div></div>
+  </div>
+  <div id="toast" class="toast" role="status"></div>
+  <script src="/gigs.js" defer></script>
+</body></html>
